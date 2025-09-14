@@ -54,7 +54,44 @@ def callback():
         abort(400)
     return 'OK'
 
-# ===== 查詢函式（保留原本邏輯） =====
+# ===== 查詢函式（年 / 月 / 日） =====
+def get_stock_info_year(symbol_code, year):
+    if symbol_code not in symbol_map:
+        return "⚠️ 股票代碼錯誤"
+
+    file_name = symbol_map[symbol_code]
+    file_path = f"stock_data/{file_name}"
+
+    if not os.path.exists(file_path):
+        return f"❌ 找不到 {symbol_code} 的資料"
+
+    try:
+        df = pd.read_csv(file_path, index_col=0)
+        df.reset_index(inplace=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+
+        df_year = df[df["Date"].dt.year == int(year)]
+
+        if df_year.empty:
+            return f"⚠️ {symbol_code} 在 {year} 沒有資料"
+
+        avg_close = df_year["Close"].mean()
+        avg_change = df_year["Change (%)"].mean()
+        max_price = df_year["High"].max()
+        min_price = df_year["Low"].min()
+
+        return (
+            f"📊 {symbol_code} 在 {year} 年總結：\n"
+            f"最高價：{max_price:.2f} 元\n"
+            f"最低價：{min_price:.2f} 元\n"
+            f"平均收盤價：{avg_close:.2f} 元\n"
+            f"平均日漲幅：{avg_change:.2f}%"
+        )
+    except Exception as e:
+        print("❗[年查詢錯誤]", e)
+        return "❌ 讀取年度資料時發生錯誤，請稍後再試"
+
+
 def get_stock_info_month(symbol_code, year, month):
     if symbol_code not in symbol_map:
         return "⚠️ 股票代碼錯誤"
@@ -140,17 +177,20 @@ def handle_message(event):
             print("📦 symbol:", symbol)
             print("📆 date_parts:", date_parts)
 
-            if len(date_parts) == 2:
+            if len(date_parts) == 1:  # 年
+                year = date_parts[0]
+                reply_text = get_stock_info_year(symbol, year)
+            elif len(date_parts) == 2:  # 年/月
                 year, month = date_parts
                 reply_text = get_stock_info_month(symbol, year, month)
-            elif len(date_parts) == 3:
+            elif len(date_parts) == 3:  # 年/月/日
                 year, month, day = date_parts
                 reply_text = get_stock_info_day(symbol, year, month, day)
             else:
-                reply_text = "⚠️ 請輸入正確格式：查詢 股票代碼 年/月 或 年/月/日"
+                reply_text = "⚠️ 請輸入正確格式：查詢 股票代碼 年 或 年/月 或 年/月/日"
         except Exception as e:
             print("❗錯誤訊息：", e)
-            reply_text = "❗請輸入格式：查詢 股票代碼 年/月 或 年/月/日（例如：查詢 2330 2023/07 或 查詢 2330 2023/07/20）"
+            reply_text = "❗請輸入格式：查詢 股票代碼 年 或 年/月 或 年/月/日（例如：查詢 2330 2023 或 查詢 2330 2023/07 或 查詢 2330 2023/07/20）"
     else:
         print("⚠️ 沒進入查詢區塊，直接回傳原始訊息")
         reply_text = f"你說的是：{msg}"
