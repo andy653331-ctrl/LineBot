@@ -30,7 +30,31 @@ symbol_map = {
     "6669": "6669.TWO_WiWynn.csv"
 }
 
-# ===== 月查詢函式 =====
+# ===== 從環境變數讀取 Channel Access Token 與 Channel Secret =====
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise ValueError("❌ 環境變數 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET 沒有設定好！")
+
+# ✅ 建立 Flask app 與 LINE 設定
+app = Flask(__name__)
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
+
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    app.logger.info("Request body: " + body)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
+        abort(400)
+    return 'OK'
+
+# ===== 查詢函式（保留原本邏輯） =====
 def get_stock_info_month(symbol_code, year, month):
     if symbol_code not in symbol_map:
         return "⚠️ 股票代碼錯誤"
@@ -42,7 +66,6 @@ def get_stock_info_month(symbol_code, year, month):
         return f"❌ 找不到 {symbol_code} 的資料"
 
     try:
-        # 修正：讀取 CSV 並還原 Date 欄位
         df = pd.read_csv(file_path, index_col=0)
         df.reset_index(inplace=True)
         df["Date"] = pd.to_datetime(df["Date"])
@@ -61,7 +84,6 @@ def get_stock_info_month(symbol_code, year, month):
         return "❌ 讀取月資料時發生錯誤，請稍後再試"
 
 
-# ===== 日查詢函式 =====
 def get_stock_info_day(symbol_code, year, month, day):
     if symbol_code not in symbol_map:
         return "⚠️ 股票代碼錯誤"
@@ -73,15 +95,13 @@ def get_stock_info_day(symbol_code, year, month, day):
         return f"❌ 找不到 {symbol_code} 的資料"
 
     try:
-        # 🛠️ 修正：跳過前 3 行（包括欄位名）並手動指定欄位名稱
         df = pd.read_csv(
             file_path,
             skiprows=3,
             names=["Date", "Open", "High", "Low", "Close", "Volume", "Change (%)"]
         )
-
         df["Date"] = pd.to_datetime(df["Date"], format="%Y-%m-%d", errors="coerce")
-        df.dropna(subset=["Date"], inplace=True)  # 避免轉換失敗導致 NaT 資料殘留
+        df.dropna(subset=["Date"], inplace=True)
 
         target_date = pd.to_datetime(f"{year}-{month.zfill(2)}-{day.zfill(2)}")
         df_day = df[df["Date"] == target_date]
@@ -90,7 +110,6 @@ def get_stock_info_day(symbol_code, year, month, day):
             return f"⚠️ {symbol_code} 在 {target_date.date()} 沒有資料（可能是假日或停市）"
 
         row = df_day.iloc[0]
-
         return (
             f"📈 {symbol_code} 在 {target_date.date()} 的資料如下：\n"
             f"開盤：{row['Open']:.2f} 元\n"
@@ -100,42 +119,16 @@ def get_stock_info_day(symbol_code, year, month, day):
             f"成交量：{int(row['Volume']):,} 股\n"
             f"漲幅：{row['Change (%)']:.2f}%"
         )
-
     except Exception as e:
         print("❗[日查詢錯誤]", e)
         return "❌ 讀取每日資料時發生錯誤，請稍後再試"
 
-
-app = Flask(__name__)
-
-configuration = Configuration(access_token='RCspTXnVJXrV0w/xmBWr5XWxS60aiTE3fHSpCZ5IP3p045Bd2iQADCCZQ/Z5dF7/RnVc2dR+Q/w4hf6xn+sJKE0pOMI5jIZ5TXuRbk2tR1fYC/rQHjsz1FI49fGaAp6n4oEn6WVtEsY9ZAVcZClL+QdB04t89/1O/w1cDnyilFU=')
-handler = WebhookHandler('5e7eebcb1aad1b213470a6e0282868de')
-
-
-@app.route("/callback", methods=['POST'])
-def callback():
-    # get X-Line-Signature header value
-    signature = request.headers['X-Line-Signature']
-
-    # get request body as text
-    body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
-
-    # handle webhook body
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
-        abort(400)
-
-    return 'OK'
-
-
+# ===== LINE 事件處理 =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     msg = event.message.text.strip()
-    msg = msg.replace("　", " ")        # 將全形空格改為半形
-    msg = " ".join(msg.split())        # 去除多餘空格
+    msg = msg.replace("　", " ")  # 全形空格
+    msg = " ".join(msg.split())  # 多餘空格
     print("🪵 處理後的訊息：", repr(msg))
 
     if msg.startswith("查詢"):
@@ -144,7 +137,6 @@ def handle_message(event):
             parts = msg.split()
             symbol = parts[1]
             date_parts = parts[2].split("/")
-
             print("📦 symbol:", symbol)
             print("📆 date_parts:", date_parts)
 
@@ -163,7 +155,6 @@ def handle_message(event):
         print("⚠️ 沒進入查詢區塊，直接回傳原始訊息")
         reply_text = f"你說的是：{msg}"
 
-    # 回傳訊息給 LINE 使用者
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
@@ -173,7 +164,8 @@ def handle_message(event):
             )
         )
 
-
-
 if __name__ == "__main__":
-    app.run()
+    # 啟動時確認有讀到 Token（只印部分，避免洩漏）
+    print("TOKEN 前10碼:", CHANNEL_ACCESS_TOKEN[:10])
+    print("SECRET 前5碼:", CHANNEL_SECRET[:5])
+    app.run(host="0.0.0.0", port=5000)
