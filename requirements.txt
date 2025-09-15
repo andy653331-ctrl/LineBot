@@ -1,5 +1,5 @@
 Flask==3.0.0
+line-bot-sdk==3.9.0
 pandas==2.2.2
 matplotlib==3.9.2
-line-bot-sdk==3.9.0
-gunicorn==22.0.0
+pillow==10.4.0
