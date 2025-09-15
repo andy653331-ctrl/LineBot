@@ -1,6 +1,7 @@
 import os
 import pandas as pd
-from flask import Flask, request, abort
+import matplotlib.pyplot as plt
+from flask import Flask, request, abort, send_from_directory
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -38,7 +39,7 @@ if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError("❌ 環境變數 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET 沒有設定好！")
 
 # ✅ 建立 Flask app 與 LINE 設定
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static")
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
@@ -133,6 +134,30 @@ def get_stock_info_day(symbol_code, year, month, day):
     )
 
 
+# ===== 畫圖函式 =====
+def plot_stock_chart(df, symbol_code, period_text):
+    """根據 DataFrame 畫收盤價折線圖，並存成圖檔到 static/"""
+    plt.figure(figsize=(8, 4))
+    plt.plot(df["Date"], df["Close"], marker="o", linestyle="-", color="b", label="收盤價")
+    plt.title(f"{symbol_code} {period_text} 收盤價走勢")
+    plt.xlabel("日期")
+    plt.ylabel("價格 (元)")
+    plt.grid(True)
+    plt.legend()
+
+    os.makedirs("static", exist_ok=True)
+    file_path = f"static/{symbol_code}_{period_text}.png"
+    plt.savefig(file_path, bbox_inches="tight")
+    plt.close()
+    return file_path
+
+
+# ===== 提供靜態檔案（圖片網址） =====
+@app.route("/static/<path:filename>")
+def serve_static(filename):
+    return send_from_directory("static", filename)
+
+
 # ===== LINE 事件處理 =====
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
@@ -141,13 +166,13 @@ def handle_message(event):
     msg = " ".join(msg.split())  # 多餘空格
     print("🪵 處理後的訊息：", repr(msg))
 
+    reply_text = None
+
     if msg.startswith("查詢"):
         try:
             parts = msg.split()
             symbol = parts[1]
             date_parts = parts[2].split("/")
-            print("📦 symbol:", symbol)
-            print("📆 date_parts:", date_parts)
 
             if len(date_parts) == 1:
                 year = date_parts[0]
@@ -162,10 +187,60 @@ def handle_message(event):
                 reply_text = "⚠️ 請輸入正確格式：查詢 股票代碼 年 或 年/月 或 年/月/日"
         except Exception as e:
             print("❗錯誤訊息：", e)
-            reply_text = "❗請輸入格式：查詢 股票代碼 年 或 年/月 或 年/月/日（例如：查詢 2330 2023 或 查詢 2330 2023/07 或 查詢 2330 2023/07/20）"
+            reply_text = "❗請輸入格式：查詢 股票代碼 年 或 年/月 或 年/月/日"
+
+    elif msg.startswith("查圖"):
+        try:
+            parts = msg.split()
+            symbol = parts[1]
+            date_parts = parts[2].split("/")
+
+            df, err = load_stock_data(symbol)
+            if err:
+                reply_text = err
+            else:
+                if len(date_parts) == 1:  # 年
+                    year = int(date_parts[0])
+                    df_filtered = df[df["Date"].dt.year == year]
+                    period_text = f"{year}"
+                elif len(date_parts) == 2:  # 年/月
+                    year, month = map(int, date_parts)
+                    df_filtered = df[(df["Date"].dt.year == year) & (df["Date"].dt.month == month)]
+                    period_text = f"{year}_{month}"
+                else:
+                    reply_text = "⚠️ 查圖格式錯誤，請輸入：查圖 股票代碼 年 或 年/月"
+                    df_filtered = None
+
+                if df_filtered is not None and not df_filtered.empty:
+                    img_path = plot_stock_chart(df_filtered, symbol, period_text)
+                    img_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/static/{os.path.basename(img_path)}"
+
+                    with ApiClient(configuration) as api_client:
+                        line_bot_api = MessagingApi(api_client)
+                        line_bot_api.reply_message_with_http_info(
+                            ReplyMessageRequest(
+                                reply_token=event.reply_token,
+                                messages=[
+                                    TextMessage(text=f"📊 {symbol} {period_text.replace('_','/')} 收盤價走勢圖如下："),
+                                    {
+                                        "type": "image",
+                                        "originalContentUrl": img_url,
+                                        "previewImageUrl": img_url
+                                    }
+                                ]
+                            )
+                        )
+                    return
+                else:
+                    reply_text = f"⚠️ {symbol} 在 {date_parts} 沒有資料"
+        except Exception as e:
+            print("❗[查圖錯誤]", e)
+            reply_text = "❌ 產生圖表時發生錯誤"
+
     else:
         reply_text = f"你說的是：{msg}"
 
+    # 回傳文字訊息
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message_with_http_info(
@@ -177,7 +252,6 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    # 啟動時確認有讀到 Token（只印部分，避免洩漏）
     print("TOKEN 前10碼:", CHANNEL_ACCESS_TOKEN[:10])
     print("SECRET 前5碼:", CHANNEL_SECRET[:5])
     app.run(host="0.0.0.0", port=5000)
