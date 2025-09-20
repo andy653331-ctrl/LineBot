@@ -1,9 +1,4 @@
-setuptools>=65.5.1
-wheel>=0.38.4
-pip>=23.3
-
-Flask==3.0.0
-line-bot-sdk==3.9.0
-pandas==2.2.2
-matplotlib==3.9.2
-pillow==10.4.0
+flask
+requests
+line-bot-sdk
+python-dotenv
