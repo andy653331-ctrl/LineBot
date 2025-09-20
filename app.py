@@ -1,7 +1,7 @@
 from flask import Flask, request, abort
 import requests
 import os
-from dotenv import load_dotenv  # 讀取 .env 檔
+from dotenv import load_dotenv
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -14,27 +14,36 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-# 載入 .env
+# 載入 .env (本地測試用，Render 會用 Environment Variables)
 load_dotenv()
 
 app = Flask(__name__)
 
-# LINE Bot 設定
+# === 讀取環境變數 ===
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# === Debug log (Render Log 可看到) ===
+print(f"[DEBUG] LINE_CHANNEL_SECRET = {CHANNEL_SECRET if CHANNEL_SECRET else '❌ None'}")
+print(f"[DEBUG] LINE_CHANNEL_ACCESS_TOKEN 前10碼 = {CHANNEL_ACCESS_TOKEN[:10] if CHANNEL_ACCESS_TOKEN else '❌ None'}")
+print(f"[DEBUG] OPENROUTER_API_KEY 前10碼 = {OPENROUTER_API_KEY[:10] if OPENROUTER_API_KEY else '❌ None'}")
+
+# === LINE Bot 設定 ===
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+    raise ValueError("❌ 環境變數錯誤：請確認 Render 上的 LINE_CHANNEL_SECRET 和 LINE_CHANNEL_ACCESS_TOKEN 已設定")
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# OpenRouter (DeepSeek Free) API
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# === DeepSeek (OpenRouter) API ===
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def call_deepseek(user_message):
     """呼叫 DeepSeek API"""
     if not OPENROUTER_API_KEY:
-        print("❌ [ERROR] 沒有找到 OPENROUTER_API_KEY，請檢查 .env")
+        print("❌ [ERROR] 沒有找到 OPENROUTER_API_KEY，請檢查環境變數")
         return "⚠️ 系統沒有設定 AI 金鑰，請通知管理員。"
 
     headers = {
@@ -50,14 +59,9 @@ def call_deepseek(user_message):
     }
 
     try:
-        # Debug: 印出 header（避免全洩漏，只印前40碼）
-        print(f"[DEBUG] Authorization header = Bearer {OPENROUTER_API_KEY[:40]}...")
-
+        print(f"[User] {user_message}")
         resp = requests.post(OPENROUTER_URL, headers=headers, json=data)
         resp_json = resp.json()
-
-        # Debug log
-        print(f"[User] {user_message}")
         print(f"[DeepSeek raw] {resp_json}")
 
         if "choices" in resp_json:
@@ -101,4 +105,5 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    app.run(port=3000, debug=True)
+    port = int(os.environ.get("PORT", 3000))  # Render 會提供 PORT
+    app.run(host="0.0.0.0", port=port, debug=True)
