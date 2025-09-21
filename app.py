@@ -1,11 +1,7 @@
 from flask import Flask, request, abort
 import os
-import re
-import requests
 import pandas as pd
 from dotenv import load_dotenv
-from datetime import datetime
-
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -24,14 +20,12 @@ app = Flask(__name__)
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# 股票清單
-STOCKS = {
+# 股票代號對應表
+STOCK_SYMBOLS = {
     "台積電": "TSM",
     "鴻海": "HNHPF",
     "聯發科": "2454.TW",
@@ -46,72 +40,98 @@ STOCKS = {
 
 DATA_DIR = "stock_data"
 
+# 幫助訊息
+HELP_TEXT = """📊 可用功能指令：
+1️⃣ 即時 AI 對話：直接輸入問題
+2️⃣ 指定日期收盤價：台積電 2023-07-01
+3️⃣ 平均價格（全期間）：台積電 平均
+4️⃣ 區間平均：台積電 平均 2023-01-01 2023-06-30
+5️⃣ 最近 N 天平均：台積電 最近10天
+6️⃣ 最高/最低：台積電 最高 | 台積電 最低
+7️⃣ 多股票同一天：台積電 鴻海 聯發科 2023-07-01
+輸入「幫助」隨時查看此清單
+"""
 
-# =============== 股票輔助函式 =================
+# 讀取股票 CSV
 def load_stock_data(symbol):
-    """讀取股票 CSV"""
     filepath = os.path.join(DATA_DIR, f"{symbol}.csv")
     if not os.path.exists(filepath):
         return None
     df = pd.read_csv(filepath)
+    if "Date" not in df.columns:
+        raise ValueError(f"{symbol} 缺少 Date 欄位")
     df["Date"] = pd.to_datetime(df["Date"])
     return df
 
+# 指令處理
+def process_command(text):
+    parts = text.strip().split()
+    if text in ["幫助", "help", "說明"]:
+        return HELP_TEXT
 
-def get_price_on_date(df, query_date):
-    """查詢指定日期，若休市則往前找最近交易日"""
-    query_date = pd.to_datetime(query_date)
-    row = df[df["Date"] == query_date]
-    if row.empty:
-        row = df[df["Date"] <= query_date].tail(1)
-    if not row.empty:
-        return row.iloc[0]["Close"], row.iloc[0]["Date"]
-    return None, None
-
-
-def get_average(df, start=None, end=None):
-    if start and end:
-        mask = (df["Date"] >= pd.to_datetime(start)) & (df["Date"] <= pd.to_datetime(end))
-        return df.loc[mask, "Close"].mean()
-    return df["Close"].mean()
-
-
-def get_recent_avg(df, days):
-    return df.tail(days)["Close"].mean()
-
-
-def get_max_min(df, mode="max"):
-    if mode == "max":
-        row = df.loc[df["Close"].idxmax()]
-    else:
-        row = df.loc[df["Close"].idxmin()]
-    return row["Close"], row["Date"]
-
-
-# =============== AI 模式 =================
-def call_deepseek(user_message):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY.strip()}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "deepseek/deepseek-chat-v3.1:free",
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": user_message}
-        ]
-    }
+    replies = []
     try:
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=data)
-        resp_json = resp.json()
-        if "choices" in resp_json:
-            return resp_json["choices"][0]["message"]["content"]
-        return f"⚠️ AI 錯誤: {resp_json}"
+        # 多股票 + 日期
+        if len(parts) >= 2 and parts[-1].count("-") == 2:
+            date = pd.to_datetime(parts[-1])
+            stocks = parts[:-1]
+            for stock in stocks:
+                if stock in STOCK_SYMBOLS:
+                    df = load_stock_data(STOCK_SYMBOLS[stock])
+                    if df is not None:
+                        row = df[df["Date"] == date]
+                        if not row.empty:
+                            price = float(row["Close"].values[0])
+                            replies.append(f"{stock} {date.date()} 收盤價: {price:.2f}")
+                        else:
+                            replies.append(f"⚠ 找不到 {stock} {date.date()} 的股價紀錄")
+            return "\n".join(replies) if replies else "⚠ 找不到資料"
+
+        # 平均價格
+        if len(parts) == 2 and parts[1] == "平均":
+            stock = parts[0]
+            if stock in STOCK_SYMBOLS:
+                df = load_stock_data(STOCK_SYMBOLS[stock])
+                if df is not None:
+                    price = float(df["Close"].mean())
+                    return f"{stock} 平均收盤價: {price:.2f}"
+
+        # 區間平均
+        if len(parts) == 4 and parts[1] == "平均":
+            stock = parts[0]
+            start, end = pd.to_datetime(parts[2]), pd.to_datetime(parts[3])
+            df = load_stock_data(STOCK_SYMBOLS[stock])
+            if df is not None:
+                mask = (df["Date"] >= start) & (df["Date"] <= end)
+                subset = df.loc[mask]
+                if not subset.empty:
+                    price = float(subset["Close"].mean())
+                    return f"{stock} {start.date()}~{end.date()} 平均收盤價: {price:.2f}"
+
+        # 最近 N 天平均
+        if len(parts) == 2 and parts[1].startswith("最近"):
+            stock = parts[0]
+            n = int(parts[1].replace("最近", "").replace("天", ""))
+            df = load_stock_data(STOCK_SYMBOLS[stock])
+            if df is not None:
+                subset = df.tail(n)
+                price = float(subset["Close"].mean())
+                return f"{stock} 最近{n}天平均收盤價: {price:.2f}"
+
+        # 最高/最低
+        if len(parts) == 2 and parts[1] in ["最高", "最低"]:
+            stock, cmd = parts
+            df = load_stock_data(STOCK_SYMBOLS[stock])
+            if df is not None:
+                price = float(df["Close"].max() if cmd == "最高" else df["Close"].min())
+                return f"{stock} 歷史{cmd}價: {price:.2f}"
+
+        return "⚠ 指令格式錯誤，輸入「幫助」查看說明"
+
     except Exception as e:
-        return f"⚠️ 呼叫 API 發生錯誤: {str(e)}"
+        return f"⚠ 錯誤: {str(e)}"
 
 
-# =============== LINE Webhook =================
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -125,9 +145,8 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    user_text = event.message.text.strip()
+    user_text = event.message.text
     reply_text = process_command(user_text)
-
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message(
@@ -137,81 +156,5 @@ def handle_message(event):
             )
         )
 
-
-# =============== 指令解析 =================
-def process_command(text):
-    # 多股票同一天
-    multi_match = re.match(r"(.+)\s+(\d{4}-\d{2}-\d{2})", text)
-    if multi_match:
-        stocks = multi_match.group(1).split()
-        date = multi_match.group(2)
-        reply = []
-        for name in stocks:
-            if name in STOCKS:
-                df = load_stock_data(STOCKS[name])
-                if df is not None:
-                    price, actual_date = get_price_on_date(df, date)
-                    if price:
-                        reply.append(f"{name} {actual_date.date()} 收盤價：{price:.2f}")
-        return "\n".join(reply) if reply else "⚠️ 找不到資料"
-
-    # 平均（全期間）
-    avg_match = re.match(r"(.+)\s+平均$", text)
-    if avg_match:
-        name = avg_match.group(1)
-        if name in STOCKS:
-            df = load_stock_data(STOCKS[name])
-            if df is not None:
-                avg = get_average(df)
-                return f"{name} 平均收盤價：{avg:.2f}"
-
-    # 區間平均
-    range_match = re.match(r"(.+)\s+平均\s+(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})", text)
-    if range_match:
-        name, start, end = range_match.groups()
-        if name in STOCKS:
-            df = load_stock_data(STOCKS[name])
-            if df is not None:
-                avg = get_average(df, start, end)
-                return f"{name} {start} ~ {end} 平均收盤價：{avg:.2f}"
-
-    # 最近N天
-    recent_match = re.match(r"(.+)\s+最近(\d+)天", text)
-    if recent_match:
-        name, days = recent_match.groups()
-        if name in STOCKS:
-            df = load_stock_data(STOCKS[name])
-            if df is not None:
-                avg = get_recent_avg(df, int(days))
-                return f"{name} 最近{days}天平均收盤價：{avg:.2f}"
-
-    # 最高 / 最低
-    max_min_match = re.match(r"(.+)\s+(最高|最低)", text)
-    if max_min_match:
-        name, mode = max_min_match.groups()
-        if name in STOCKS:
-            df = load_stock_data(STOCKS[name])
-            if df is not None:
-                price, date = get_max_min(df, "max" if mode == "最高" else "min")
-                return f"{name} {mode}價：{price:.2f} ({date.date()})"
-
-    # 單一股票指定日期
-    date_match = re.match(r"(.+)\s+(\d{4}-\d{2}-\d{2})", text)
-    if date_match:
-        name, date = date_match.groups()
-        if name in STOCKS:
-            df = load_stock_data(STOCKS[name])
-            if df is not None:
-                price, actual_date = get_price_on_date(df, date)
-                if price:
-                    return f"{name} {actual_date.date()} 收盤價：{price:.2f}"
-                else:
-                    return f"⚠️ 找不到 {date} 的股價記錄"
-
-    # 如果都不是 → 進 AI 模式
-    return call_deepseek(text)
-
-
-# ============================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
+    app.run(host="0.0.0.0", port=10000, debug=True)
