@@ -1,9 +1,10 @@
 from flask import Flask, request, abort
-import requests
 import os
+import re
+import requests
 import pandas as pd
-import yfinance as yf
 from dotenv import load_dotenv
+from datetime import datetime
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -16,23 +17,21 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-# 載入 .env
+# 載入環境變數
 load_dotenv()
 
 app = Flask(__name__)
 
-# LINE Bot 設定
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
-
-# OpenRouter (DeepSeek Free) API
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# 股票對照表
-stock_map = {
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
+
+# 股票清單
+STOCKS = {
     "台積電": "TSM",
     "鴻海": "HNHPF",
     "聯發科": "2454.TW",
@@ -42,14 +41,55 @@ stock_map = {
     "大立光": "3008.TW",
     "廣達": "2382.TW",
     "光寶科": "2301.TW",
-    "緯穎": "6669.TW"
+    "緯穎": "6669.TW",
 }
 
+DATA_DIR = "stock_data"
 
-# ========== 功能函式 ==========
 
+# =============== 股票輔助函式 =================
+def load_stock_data(symbol):
+    """讀取股票 CSV"""
+    filepath = os.path.join(DATA_DIR, f"{symbol}.csv")
+    if not os.path.exists(filepath):
+        return None
+    df = pd.read_csv(filepath)
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df
+
+
+def get_price_on_date(df, query_date):
+    """查詢指定日期，若休市則往前找最近交易日"""
+    query_date = pd.to_datetime(query_date)
+    row = df[df["Date"] == query_date]
+    if row.empty:
+        row = df[df["Date"] <= query_date].tail(1)
+    if not row.empty:
+        return row.iloc[0]["Close"], row.iloc[0]["Date"]
+    return None, None
+
+
+def get_average(df, start=None, end=None):
+    if start and end:
+        mask = (df["Date"] >= pd.to_datetime(start)) & (df["Date"] <= pd.to_datetime(end))
+        return df.loc[mask, "Close"].mean()
+    return df["Close"].mean()
+
+
+def get_recent_avg(df, days):
+    return df.tail(days)["Close"].mean()
+
+
+def get_max_min(df, mode="max"):
+    if mode == "max":
+        row = df.loc[df["Close"].idxmax()]
+    else:
+        row = df.loc[df["Close"].idxmin()]
+    return row["Close"], row["Date"]
+
+
+# =============== AI 模式 =================
 def call_deepseek(user_message):
-    """呼叫 DeepSeek AI"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY.strip()}",
         "Content-Type": "application/json"
@@ -66,72 +106,12 @@ def call_deepseek(user_message):
         resp_json = resp.json()
         if "choices" in resp_json:
             return resp_json["choices"][0]["message"]["content"]
-        else:
-            return f"⚠️ AI 錯誤: {resp_json}"
+        return f"⚠️ AI 錯誤: {resp_json}"
     except Exception as e:
-        return f"⚠️ 呼叫 AI 錯誤: {str(e)}"
+        return f"⚠️ 呼叫 API 發生錯誤: {str(e)}"
 
 
-def get_realtime_price(symbol):
-    """即時股價"""
-    try:
-        ticker = yf.Ticker(symbol)
-        price = ticker.history(period="1d")["Close"].iloc[-1]
-        return f"{symbol} 即時收盤價：{price:.2f}"
-    except Exception:
-        return f"⚠️ 無法取得 {symbol} 即時股價"
-
-
-def get_historical_price(symbol, date):
-    """歷史股價（從 stock_data CSV 讀取）"""
-    filepath = f"stock_data/{symbol}.csv"
-    if not os.path.exists(filepath):
-        return f"⚠️ 找不到 {symbol} 的歷史資料檔"
-    df = pd.read_csv(filepath)
-    df["Date"] = pd.to_datetime(df["Date"])
-    row = df[df["Date"] == pd.to_datetime(date)]
-    if row.empty:
-        return f"⚠️ 找不到 {date} 的股價紀錄"
-    price = row.iloc[0]["Close"]
-    return f"{symbol} 在 {date} 的收盤價：{price:.2f}"
-
-
-def get_average_price(symbol, start=None, end=None, days=None):
-    """平均價（全期間 / 區間 / 最近N天）"""
-    filepath = f"stock_data/{symbol}.csv"
-    if not os.path.exists(filepath):
-        return f"⚠️ 找不到 {symbol} 的歷史資料檔"
-    df = pd.read_csv(filepath)
-    df["Date"] = pd.to_datetime(df["Date"])
-
-    if days:
-        df = df.tail(days)
-    elif start and end:
-        df = df[(df["Date"] >= pd.to_datetime(start)) & (df["Date"] <= pd.to_datetime(end))]
-
-    if df.empty:
-        return f"⚠️ 找不到指定範圍的資料"
-
-    avg = df["Close"].mean()
-    return f"{symbol} 平均收盤價：{avg:.2f}"
-
-
-def get_high_low(symbol, mode="high"):
-    """最高 / 最低價"""
-    filepath = f"stock_data/{symbol}.csv"
-    if not os.path.exists(filepath):
-        return f"⚠️ 找不到 {symbol} 的歷史資料檔"
-    df = pd.read_csv(filepath)
-
-    if mode == "high":
-        price = df["High"].max()
-        return f"{symbol} 歷史最高價：{price:.2f}"
-    else:
-        price = df["Low"].min()
-        return f"{symbol} 歷史最低價：{price:.2f}"
-
-
-# ========== LINE Webhook ==========
+# =============== LINE Webhook =================
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -146,63 +126,8 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_text = event.message.text.strip()
-    reply_text = None
+    reply_text = process_command(user_text)
 
-    # 幫助指令
-    if user_text in ["幫助", "help"]:
-        reply_text = (
-            "📌 可用功能指令：\n"
-            "1️⃣ 即時 AI 對話：直接輸入問題\n"
-            "2️⃣ 指定日期收盤價：台積電 2023-07-01\n"
-            "3️⃣ 平均價格（全期間）：台積電 平均\n"
-            "4️⃣ 區間平均：台積電 平均 2023-01-01 2023-06-30\n"
-            "5️⃣ 最近 N 天平均：台積電 最近10天\n"
-            "6️⃣ 最高/最低：台積電 最高 | 台積電 最低\n"
-            "7️⃣ 多股票同一天：台積電 鴻海 聯發科 2023-07-01"
-        )
-
-    else:
-        parts = user_text.split()
-        # 格式：股票 日期
-        if len(parts) == 2 and parts[0] in stock_map:
-            name, arg = parts
-            symbol = stock_map[name]
-
-            if "-" in arg:  # 日期
-                reply_text = get_historical_price(symbol, arg)
-            elif arg == "平均":
-                reply_text = get_average_price(symbol)
-            elif arg == "最高":
-                reply_text = get_high_low(symbol, "high")
-            elif arg == "最低":
-                reply_text = get_high_low(symbol, "low")
-            elif "最近" in arg:
-                days = int(arg.replace("最近", "").replace("天", ""))
-                reply_text = get_average_price(symbol, days=days)
-            else:
-                reply_text = get_realtime_price(symbol)
-
-        # 格式：股票 平均 start end
-        elif len(parts) == 4 and parts[0] in stock_map and parts[1] == "平均":
-            name, _, start, end = parts
-            symbol = stock_map[name]
-            reply_text = get_average_price(symbol, start=start, end=end)
-
-        # 格式：多股票 日期
-        elif len(parts) >= 2 and parts[-1].count("-") == 2:
-            date = parts[-1]
-            names = parts[:-1]
-            replies = []
-            for n in names:
-                if n in stock_map:
-                    replies.append(get_historical_price(stock_map[n], date))
-            reply_text = "\n".join(replies) if replies else "⚠️ 沒有有效的股票名稱"
-
-        # 預設走 AI
-        else:
-            reply_text = call_deepseek(user_text)
-
-    # 回覆 LINE
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message(
@@ -213,6 +138,80 @@ def handle_message(event):
         )
 
 
+# =============== 指令解析 =================
+def process_command(text):
+    # 多股票同一天
+    multi_match = re.match(r"(.+)\s+(\d{4}-\d{2}-\d{2})", text)
+    if multi_match:
+        stocks = multi_match.group(1).split()
+        date = multi_match.group(2)
+        reply = []
+        for name in stocks:
+            if name in STOCKS:
+                df = load_stock_data(STOCKS[name])
+                if df is not None:
+                    price, actual_date = get_price_on_date(df, date)
+                    if price:
+                        reply.append(f"{name} {actual_date.date()} 收盤價：{price:.2f}")
+        return "\n".join(reply) if reply else "⚠️ 找不到資料"
+
+    # 平均（全期間）
+    avg_match = re.match(r"(.+)\s+平均$", text)
+    if avg_match:
+        name = avg_match.group(1)
+        if name in STOCKS:
+            df = load_stock_data(STOCKS[name])
+            if df is not None:
+                avg = get_average(df)
+                return f"{name} 平均收盤價：{avg:.2f}"
+
+    # 區間平均
+    range_match = re.match(r"(.+)\s+平均\s+(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})", text)
+    if range_match:
+        name, start, end = range_match.groups()
+        if name in STOCKS:
+            df = load_stock_data(STOCKS[name])
+            if df is not None:
+                avg = get_average(df, start, end)
+                return f"{name} {start} ~ {end} 平均收盤價：{avg:.2f}"
+
+    # 最近N天
+    recent_match = re.match(r"(.+)\s+最近(\d+)天", text)
+    if recent_match:
+        name, days = recent_match.groups()
+        if name in STOCKS:
+            df = load_stock_data(STOCKS[name])
+            if df is not None:
+                avg = get_recent_avg(df, int(days))
+                return f"{name} 最近{days}天平均收盤價：{avg:.2f}"
+
+    # 最高 / 最低
+    max_min_match = re.match(r"(.+)\s+(最高|最低)", text)
+    if max_min_match:
+        name, mode = max_min_match.groups()
+        if name in STOCKS:
+            df = load_stock_data(STOCKS[name])
+            if df is not None:
+                price, date = get_max_min(df, "max" if mode == "最高" else "min")
+                return f"{name} {mode}價：{price:.2f} ({date.date()})"
+
+    # 單一股票指定日期
+    date_match = re.match(r"(.+)\s+(\d{4}-\d{2}-\d{2})", text)
+    if date_match:
+        name, date = date_match.groups()
+        if name in STOCKS:
+            df = load_stock_data(STOCKS[name])
+            if df is not None:
+                price, actual_date = get_price_on_date(df, date)
+                if price:
+                    return f"{name} {actual_date.date()} 收盤價：{price:.2f}"
+                else:
+                    return f"⚠️ 找不到 {date} 的股價記錄"
+
+    # 如果都不是 → 進 AI 模式
+    return call_deepseek(text)
+
+
+# ============================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Render 會自動給 PORT
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
