@@ -12,7 +12,7 @@ stock_symbols = {
     "Largan": "3008.TW",
     "Quanta": "2382.TW",
     "Lite-On": "2301.TW",
-    "WiWynn": "6669.TWO"
+    "WiWynn": "6669.TW"
 }
 
 start_date = "2023-01-01"
